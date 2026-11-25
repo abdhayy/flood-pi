@@ -20,6 +20,7 @@ POLL_INTERVAL = 0.05
 STABLE_SECONDS = 0.25
 RETRY_SECONDS = 10
 HEARTBEAT_SECONDS = 15
+SSH_PREVIEW_URL = "http://127.0.0.1:13610/api/flood-alerts"
 
 
 class NoRedirect(HTTPRedirectHandler):
@@ -55,6 +56,44 @@ def simulate_alert(url, token, device_id):
     except OSError as error:
         raise SystemExit(f"Could not send the test alert: {error}.") from None
     print(f"Test flood alert sent ({event['event_id']}).")
+
+
+def simulate_sensor(url, token, device_id):
+    stop = Event()
+    statuses = Queue()
+    alerts = Queue()
+    device = {"device_id": device_id[:115] + "-simulation", "simulated": True}
+    status_url = url.rstrip("/") + "/status"
+    Thread(target=send_status, args=(statuses, stop, status_url, token), daemon=True).start()
+    Thread(target=send_alerts, args=(alerts, stop, url, token), daemon=True).start()
+    current = None
+
+    def publish(status):
+        nonlocal current
+        if status == current:
+            return
+        current = status
+        timestamp = datetime.now(timezone.utc).isoformat()
+        event_id = str(uuid4()) if status == "flooded" else None
+        if event_id:
+            alerts.put({**device, "event_id": event_id, "event_type": "flood_detected",
+                        "detected_at": timestamp})
+        statuses.put({**device, "status": status, "status_since": timestamp, "event_id": event_id})
+
+    publish("normal")
+    try:
+        while True:
+            command = input("Simulated sensor [dry / wet / quit]: ").strip().lower()
+            if command == "quit":
+                break
+            if command in ("dry", "wet"):
+                publish("normal" if command == "dry" else "flooded")
+            else:
+                print("Enter dry, wet, or quit.")
+    except (EOFError, KeyboardInterrupt):
+        print()
+    finally:
+        stop.set()
 
 
 def send_alerts(outbox, stop, url, token):
@@ -145,21 +184,33 @@ def monitor(sensor, siren, stop, outbox, device_id, status_updates=None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--simulate-alert", action="store_true",
-                        help="Send one labeled web test alert without using GPIO or changing live sensor status.")
+    simulation = parser.add_mutually_exclusive_group()
+    simulation.add_argument("--simulate-alert", action="store_true",
+                            help="Send one labeled web test alert without using GPIO or changing live sensor status.")
+    simulation.add_argument("--simulate-sensor", action="store_true",
+                            help="Interactively send dry or wet readings to the laptop preview, without using GPIO.")
+    parser.add_argument("--laptop-preview", action="store_true",
+                        help="Send to the laptop preview through the SSH tunnel on local port 13610.")
     args = parser.parse_args()
+    if args.simulate_sensor and not args.laptop_preview:
+        parser.error("--simulate-sensor requires --laptop-preview.")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    url = os.getenv("SHE_FLOOD_ALERT_URL", "").strip()
+    url = SSH_PREVIEW_URL if args.laptop_preview else os.getenv("SHE_FLOOD_ALERT_URL", "").strip()
     token = os.getenv("SHE_FLOOD_ALERT_TOKEN", "").strip()
+    if args.laptop_preview and not token:
+        parser.error("Set SHE_FLOOD_ALERT_TOKEN to the laptop preview token.")
     endpoint = urlsplit(url)
     if url and (endpoint.scheme not in ("http", "https") or not endpoint.hostname):
         raise SystemExit("Set SHE_FLOOD_ALERT_URL to an absolute HTTP or HTTPS URL.")
-    if url and token and endpoint.scheme != "https":
+    if url and token and endpoint.scheme != "https" and not args.laptop_preview:
         raise SystemExit("Use an HTTPS alert URL when sending an authentication token.")
 
     device_id = os.getenv("FLOOD_DEVICE_ID") or socket.gethostname()
     if args.simulate_alert:
         simulate_alert(url, token, device_id)
+        return
+    if args.simulate_sensor:
+        simulate_sensor(url, token, device_id)
         return
 
     sensor_pin = int(os.getenv("FLOOD_SENSOR_GPIO", "17"))
