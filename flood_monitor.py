@@ -1,4 +1,4 @@
-"""Monitor an active-high flood sensor and report flood events to SHE Digital."""
+"""Monitor active-low flood and active-high relay feedback inputs for SHE Digital."""
 
 import argparse
 import json
@@ -143,24 +143,40 @@ def send_status(updates, stop, url, token):
             logging.warning("Flood sensor status could not be sent: %s", error)
 
 
-def monitor(sensor, siren, stop, outbox, device_id, status_updates=None):
+class DebouncedInput:
+    def __init__(self):
+        self.value = None
+        self.last_reading = None
+        self.changed_at = monotonic()
+
+    def update(self, reading, now):
+        if reading != self.last_reading:
+            self.last_reading = reading
+            self.changed_at = now
+        if reading != self.value and now - self.changed_at >= STABLE_SECONDS:
+            self.value = reading
+            return True
+        return False
+
+
+def monitor(sensor, relay_feedback, stop, outbox, device_id, status_updates=None):
     device = {"device_id": device_id, "location": os.getenv("FLOOD_DEVICE_LOCATION", "").strip()}
-    flooded = None
-    last_reading = None
-    changed_at = monotonic()
+    flood = DebouncedInput()
+    relay = DebouncedInput()
+    status_since = None
+    event_id = None
     while not stop.is_set():
-        reading = sensor.is_active
         now = monotonic()
-        if reading != last_reading:
-            last_reading = reading
-            changed_at = now
-        if reading != flooded and now - changed_at >= STABLE_SECONDS:
-            flooded = reading
+        flood_changed = flood.update(sensor.is_active, now)
+        # GPIO Zero's pull-up input is active-low. Invert it to report physical HIGH.
+        relay_changed = relay.update(not relay_feedback.is_active, now)
+        if relay_changed:
+            logging.info("Siren relay feedback: %s.", "ON" if relay.value else "OFF")
+        if flood_changed:
             status_since = datetime.now(timezone.utc).isoformat()
             event_id = None
-            if flooded:
-                siren.on()
-                logging.warning("Flood detected. Siren on.")
+            if flood.value:
+                logging.warning("Flood detected.")
                 event_id = str(uuid4())
                 if outbox is not None:
                     outbox.put({
@@ -170,15 +186,15 @@ def monitor(sensor, siren, stop, outbox, device_id, status_updates=None):
                         "detected_at": status_since,
                     })
             else:
-                siren.off()
-                logging.info("Sensor dry. Siren off.")
-            if status_updates is not None:
-                status_updates.put({
-                    **device,
-                    "status": "flooded" if flooded else "normal",
-                    "status_since": status_since,
-                    "event_id": event_id,
-                })
+                logging.info("Sensor dry.")
+        if status_updates is not None and status_since is not None and (flood_changed or relay_changed):
+            status_updates.put({
+                **device,
+                "status": "flooded" if flood.value else "normal",
+                "status_since": status_since,
+                "event_id": event_id,
+                "relay_on": relay.value,
+            })
         stop.wait(POLL_INTERVAL)
 
 
@@ -214,11 +230,11 @@ def main():
         return
 
     sensor_pin = int(os.getenv("FLOOD_SENSOR_GPIO", "17"))
-    siren_pin = int(os.getenv("FLOOD_SIREN_GPIO", "27"))
-    if sensor_pin == siren_pin:
-        raise SystemExit("Choose different BCM pins for the sensor and siren.")
+    feedback_pin = int(os.getenv("FLOOD_SIREN_STATUS_GPIO", os.getenv("FLOOD_SIREN_GPIO", "27")))
+    if sensor_pin == feedback_pin:
+        raise SystemExit("Choose different BCM pins for the sensor and siren relay feedback.")
 
-    from gpiozero import DigitalInputDevice, OutputDevice
+    from gpiozero import DigitalInputDevice
 
     stop = Event()
 
@@ -229,21 +245,21 @@ def main():
     signal.signal(signal.SIGINT, handle_stop)
     outbox = Queue() if url else None
     status_updates = Queue() if url else None
-    siren_active_high = os.getenv("FLOOD_SIREN_ACTIVE_LOW", "0") != "1"
-    with DigitalInputDevice(sensor_pin, pull_up=False) as sensor, OutputDevice(
-        siren_pin, active_high=siren_active_high, initial_value=False
-    ) as siren:
+    with DigitalInputDevice(sensor_pin, pull_up=True) as sensor, DigitalInputDevice(
+        feedback_pin, pull_up=True
+    ) as relay_feedback:
+        logging.info("Sensor GPIO%d: LOW means wet. Relay feedback GPIO%d: HIGH means ON. Both pins are inputs.",
+                     sensor_pin, feedback_pin)
         if outbox is None:
-            logging.info("Running in siren-only mode. Set SHE_FLOOD_ALERT_URL to send alerts.")
+            logging.info("Monitoring locally. Set SHE_FLOOD_ALERT_URL to report readings to SHE Digital.")
         else:
             Thread(target=send_alerts, args=(outbox, stop, url, token), daemon=True).start()
             status_url = endpoint._replace(path=endpoint.path.rstrip("/") + "/status").geturl()
             Thread(target=send_status, args=(status_updates, stop, status_url, token), daemon=True).start()
         try:
-            monitor(sensor, siren, stop, outbox, device_id, status_updates)
+            monitor(sensor, relay_feedback, stop, outbox, device_id, status_updates)
         finally:
             stop.set()
-            siren.off()
 
 
 if __name__ == "__main__":
