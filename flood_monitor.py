@@ -1,4 +1,4 @@
-"""Monitor active-low flood and active-high relay feedback inputs for SHE Digital."""
+"""Monitor active-low flood and siren relay feedback inputs for SHE Digital."""
 
 import argparse
 import json
@@ -168,8 +168,7 @@ def monitor(sensor, relay_feedback, stop, outbox, device_id, status_updates=None
     while not stop.is_set():
         now = monotonic()
         flood_changed = flood.update(sensor.is_active, now)
-        # GPIO Zero's pull-up input is active-low. Invert it to report physical HIGH.
-        relay_changed = relay.update(not relay_feedback.is_active, now)
+        relay_changed = relay.update(relay_feedback.is_active, now)
         if relay_changed:
             logging.info("Siren relay feedback: %s.", "ON" if relay.value else "OFF")
         if flood_changed:
@@ -248,7 +247,7 @@ def main():
     with DigitalInputDevice(sensor_pin, pull_up=True) as sensor, DigitalInputDevice(
         feedback_pin, pull_up=True
     ) as relay_feedback:
-        logging.info("Sensor GPIO%d: LOW means wet. Relay feedback GPIO%d: HIGH means ON. Both pins are inputs.",
+        logging.info("Sensor GPIO%d: LOW means wet. Relay feedback GPIO%d: LOW means ON. Both pins use input pull-ups.",
                      sensor_pin, feedback_pin)
         if outbox is None:
             logging.info("Monitoring locally. Set SHE_FLOOD_ALERT_URL to report readings to SHE Digital.")
